@@ -162,17 +162,8 @@ class LeWorldModel(nn.Module):
         self.with_terminal_prediction   = with_terminal_prediction
         self.with_reward_prediction     = with_reward_prediction
         self.fsq_encoder                = fsq_encoder
-        if self.autoregressive_rollout_length < 1:
-            raise ValueError("autoregressive_rollout_length must be at least 1")
-        if not 0.0 <= self.teacher_forcing_probability <= 1.0:
-            raise ValueError("teacher_forcing_probability must be between 0 and 1")
-        if not 0.0 <= self.reward_priority_fraction <= 1.0:
-            raise ValueError("reward_priority_fraction must be between 0 and 1")
-        if not 0.0 <= self.reward_high_quantile <= 1.0:
-            raise ValueError("reward_high_quantile must be between 0 and 1")
-        if not 0.0 <= self.validation_fraction < 1.0:
-            raise ValueError("validation_fraction must be in [0, 1)")
 
+        # Sigreg is only for continuous latent space
         self.sigreg                 = SIGReg()
 
         # ----- Encoder ------
@@ -276,7 +267,11 @@ class LeWorldModel(nn.Module):
         # Embed the FSQ codes
         if len(state_seq.shape) > 2:
             state_seq = rearrange(state_seq, "bs seq f -> (bs seq) f")
+
+        # Encode the sequence with FSQ
         emb = self.encoder_emb(state_seq.long())
+
+        # Time-based transformer
         # Add a CLS token
         cls_tkns = torch.repeat_interleave(self.cls_tkn.view(1, -1), emb.shape[0], dim=0).view(emb.shape[0], 1, -1)
         emb = torch.concat([cls_tkns, emb], dim=1)
@@ -296,13 +291,6 @@ class LeWorldModel(nn.Module):
             predicted_logits = rearrange(predicted, "bs (d l) -> bs d l", d=self.fsq_output_size, l=self.fsq_L)
             predicted_probs = F.softmax(predicted_logits, dim=-1)
             if deterministic:
-                # level_values = torch.arange(
-                #     self.fsq_L,
-                #     device=predicted_logits.device,
-                #     dtype=predicted_logits.dtype
-                # )
-                # level_values = self.encoder.shift_and_scale(level_values)
-                # predicted = (predicted_probs * level_values.view(1, 1, -1)).sum(dim=-1)
                 predicted = torch.argmax(predicted_probs, dim=-1)
             else:
                 dist = Categorical(predicted_probs)
@@ -344,19 +332,9 @@ class LeWorldModel(nn.Module):
             quantized_values = self.encoder(x)
 
             if self.fsq_encoder:
-                code_indices = self.encoder.reshift_and_rescale(
-                    quantized_values.detach()
-                )
-                code_indices = rearrange(
-                    code_indices,
-                    "(bs seq) h -> bs seq h",
-                    bs=bs
-                )
-                quantized_values = rearrange(
-                    quantized_values,
-                    "(bs seq) h -> bs seq h",
-                    bs=bs
-                )
+                code_indices = self.encoder.reshift_and_rescale(quantized_values.detach())
+                code_indices = rearrange(code_indices, "(bs seq) h -> bs seq h", bs=bs )
+                quantized_values = rearrange(quantized_values, "(bs seq) h -> bs seq h", bs=bs)
 
                 if return_quantized:
                     return code_indices, quantized_values
@@ -370,7 +348,9 @@ class LeWorldModel(nn.Module):
 #######################################################################################
     def set_dataset(self, dataset):
         # We assume the dataset is a dict of states, actions, rewards, next_states
-        # But we will not use everything (e.g. the rewards)
+        # TODO: This does not take into account the ending of sequences. 
+        # Not sure it really matters for this small project, but it is something
+        # to keep in mind
 
         self.dataset                = dataset
 
@@ -382,472 +362,103 @@ class LeWorldModel(nn.Module):
 
             if not isinstance(self.dataset[key], np.ndarray):
                 self.dataset[key]   = np.asarray(self.dataset[key])
-
-        sequence_length = self.max_seq_length + self.autoregressive_rollout_length
-        dataset_length = self.dataset["states"].shape[0]
-        has_next_states = "next_states" in self.dataset
-        num_windows = (
-            dataset_length - sequence_length + 2
-            if has_next_states
-            else dataset_length - sequence_length + 1
-        )
-        valid_starts = np.arange(max(0, num_windows))
-        if "terminals" in self.dataset:
-            terminals = self.dataset["terminals"]
-            if torch.is_tensor(terminals):
-                terminals = terminals.detach().cpu().numpy()
-            terminals = np.asarray(terminals).reshape(-1).astype(bool)
-            valid_starts = np.asarray([
-                start for start in valid_starts
-                # A terminal is valid on the final modeled transition, but
-                # never before it: no prediction may cross an episode boundary.
-                if not terminals[start:start + sequence_length - 2].any()
-            ])
-        self.validation_sequence_starts = np.asarray([], dtype=np.int64)
-        if (
-            self.validation_fraction > 0
-            and "terminals" in self.dataset
-        ):
-            episode_ids = np.cumsum(np.concatenate([
-                np.asarray([False]),
-                terminals[:-1],
-            ]))
-            unique_episodes = np.unique(episode_ids)
-            if len(unique_episodes) > 1:
-                rng = np.random.default_rng(self.validation_seed)
-                num_validation_episodes = max(
-                    1,
-                    int(round(
-                        len(unique_episodes) * self.validation_fraction
-                    ))
-                )
-                num_validation_episodes = min(
-                    num_validation_episodes,
-                    len(unique_episodes) - 1,
-                )
-                validation_episodes = rng.choice(
-                    unique_episodes,
-                    size=num_validation_episodes,
-                    replace=False,
-                )
-                validation_transition_mask = np.isin(
-                    episode_ids, validation_episodes
-                )
-                validation_start_mask = validation_transition_mask[
-                    valid_starts
-                ]
-                self.validation_sequence_starts = valid_starts[
-                    validation_start_mask
-                ]
-                valid_starts = valid_starts[~validation_start_mask]
-
-        self.valid_sequence_starts = valid_starts
-        if len(self.valid_sequence_starts) == 0:
-            raise ValueError(
-                f"Dataset has no episode-safe windows of length {sequence_length}"
-            )
-
-        self.terminal_sequence_starts = np.asarray([], dtype=np.int64)
-        self.high_reward_sequence_starts = np.asarray([], dtype=np.int64)
-        if "rewards" in self.dataset:
-            rewards = self.dataset["rewards"]
-            if torch.is_tensor(rewards):
-                rewards = rewards.detach().cpu().numpy()
-            rewards = np.asarray(rewards).reshape(-1)
-            training_reward_indices = (
-                np.arange(len(rewards))
-                if len(self.validation_sequence_starts) == 0
-                else np.setdiff1d(
-                    np.arange(len(rewards)),
-                    np.concatenate([
-                        np.arange(
-                            start,
-                            start + sequence_length - 1,
-                        )
-                        for start in self.validation_sequence_starts
-                    ]),
-                )
-            )
-            high_reward_threshold = np.quantile(
-                np.abs(rewards[training_reward_indices]),
-                self.reward_high_quantile
-            )
-            final_transition_indices = (
-                self.valid_sequence_starts + sequence_length - 2
-            )
-            self.high_reward_sequence_starts = self.valid_sequence_starts[
-                np.abs(rewards[final_transition_indices])
-                >= high_reward_threshold
-            ]
-            if "terminals" in self.dataset:
-                self.terminal_sequence_starts = self.valid_sequence_starts[
-                    terminals[final_transition_indices]
-                ]
             
 #######################################################################################
     def train_step(self, states_seq, actions_seq, rewards_seq=None, terminals_seq=None):
-        states_seq = states_seq.float()
-        actions_seq = actions_seq.float()
+    
+        latents                                                                     = self.encoder_fwd(states_seq)
+        predicted, predicted_logits, predicted_rewards, predicted_terminals         = self.predictor_fwd([latents[:, :-1], actions_seq[:, :-1], None], deterministic=False)
         if rewards_seq is not None:
-            rewards_seq = rewards_seq.float()
+            rewards_seq                                                                 = rewards_seq[:, :-1]
         if terminals_seq is not None:
-            terminals_seq = terminals_seq.float()
-
+            terminals_seq                                                               = terminals_seq[:, :-1]
+    
+        labels      = latents[:, 1:]
+    
         if self.fsq_encoder:
-            latents, quantized_values = self.encoder_fwd(
-                states_seq,
-                return_quantized=True
-            )
-        else:
-            latents = self.encoder_fwd(states_seq)
-            quantized_values = None
-
-        one_step_latents = latents[:, :self.max_seq_length + 1]
-        one_step_actions = actions_seq[:, :self.max_seq_length]
-        predicted, predicted_logits, predicted_rewards, predicted_terminals = self.predictor_fwd(
-            [one_step_latents[:, :-1], one_step_actions, None],
-            deterministic=False
-        )
-        one_step_rewards_seq = None
-        if rewards_seq is not None:
-            one_step_rewards_seq = rewards_seq[:, :self.max_seq_length]
-        one_step_terminals_seq = None
-        if terminals_seq is not None:
-            one_step_terminals_seq = terminals_seq[:, :self.max_seq_length]
-
-        labels = one_step_latents[:, 1:]
-
-        if self.fsq_encoder:
-            target_indices      = labels.detach()
-            labels              = rearrange(target_indices, "bs t f -> (bs t f)").long()
             categorical_logits  = rearrange(predicted_logits, "bs t f d -> (bs t f) d")
-            categorical_loss    = F.cross_entropy(categorical_logits, labels)
-
-            with torch.no_grad():
-                predicted_indices = predicted_logits.argmax(dim=-1)
-                predicted_values = self.encoder.shift_and_scale(
-                    predicted_indices.float()
-                )
-                target_values = self.encoder.shift_and_scale(
-                    target_indices.float()
-                )
-                latent_mse_metric = F.mse_loss(
-                    predicted_values,
-                    target_values
-                )
-
-            pred_loss = categorical_loss
-            autoregressive_loss = predicted_logits.new_zeros(())
-            autoregressive_correct = predicted_logits.new_zeros(())
-            autoregressive_reward_predictions = []
-            autoregressive_reward_targets = []
-            code_context = latents[:, :self.max_seq_length].detach()
-            action_context = actions_seq[:, :self.max_seq_length]
-
-            for rollout_step in range(self.autoregressive_rollout_length):
-                _, rollout_logits, rollout_rewards, _ = self.predictor_fwd(
-                    [code_context, action_context, None],
-                    deterministic=True
-                )
-                next_logits = rollout_logits[:, -1]
-                target_codes = latents[
-                    :, self.max_seq_length + rollout_step
-                ].detach().long()
-                autoregressive_loss = autoregressive_loss + F.cross_entropy(
-                    rearrange(next_logits, "bs f d -> (bs f) d"),
-                    rearrange(target_codes, "bs f -> (bs f)")
-                )
-                predicted_codes = next_logits.argmax(dim=-1)
-                autoregressive_correct = autoregressive_correct + (
-                    predicted_codes == target_codes
-                ).float().mean()
-                if self.with_reward_prediction:
-                    autoregressive_reward_predictions.append(
-                        rollout_rewards[:, -1, 0]
-                    )
-                    reward_index = (
-                        self.max_seq_length - 1 + rollout_step
-                    )
-                    autoregressive_reward_targets.append(
-                        rewards_seq[:, reward_index].reshape(-1)
-                    )
-
-                if rollout_step + 1 < self.autoregressive_rollout_length:
-                    teacher_mask = (
-                        torch.rand(
-                            target_codes.shape[0], 1,
-                            device=target_codes.device
-                        ) < self.teacher_forcing_probability
-                    )
-                    next_codes = torch.where(
-                        teacher_mask, target_codes, predicted_codes
-                    )
-                    code_context = torch.cat(
-                        [code_context[:, 1:], next_codes.unsqueeze(1)], dim=1
-                    )
-                    next_action_index = self.max_seq_length + rollout_step
-                    action_context = torch.cat(
-                        [
-                            action_context[:, 1:],
-                            actions_seq[:, next_action_index].unsqueeze(1)
-                        ],
-                        dim=1
-                    )
-
-            autoregressive_loss = (
-                autoregressive_loss / self.autoregressive_rollout_length
-            )
-            autoregressive_code_accuracy = (
-                autoregressive_correct / self.autoregressive_rollout_length
-            )
-            pred_loss = (
-                categorical_loss
-                + self.autoregressive_loss_weight * autoregressive_loss
-            )
-            # predicted_probs     = F.softmax(predicted_logits, dim=-1)
-            # level_values        = torch.arange(
-            #     self.fsq_L,
-            #     device=predicted_logits.device,
-            #     dtype=predicted_logits.dtype
-            # )
-            # level_values        = self.encoder.shift_and_scale(level_values)
-            # expected_latents    = (predicted_probs * level_values.view(1, 1, 1, -1)).sum(dim=-1)
-            # latent_l1_loss      = F.l1_loss(expected_latents, target_latents)
-            # latent_mse_metric   = F.mse_loss(expected_latents.detach(), target_latents.detach())
-            # pred_loss           = categorical_loss + self.lambd_latent_l1 * latent_l1_loss
-
-            reconstructed_states = self.reconstruction_head(quantized_values)
-            reconstruction_loss = F.smooth_l1_loss(reconstructed_states, states_seq.float())
-            sigreg_loss         = 0
+            categorical_loss    = F.cross_entropy(categorical_logits, labels.reshape(-1))
+    
+            pred_loss           = categorical_loss
+    
+            shifted_latents         = self.encoder.shift_and_scale(latents)
+            reconstructed_states    = self.reconstruction_head(shifted_latents)
+            reconstruction_loss     = F.smooth_l1_loss(reconstructed_states, states_seq.float())
+            sigreg_loss             = 0
         else:
             pred_loss   = (labels - predicted).pow(2).mean()
             sigreg_loss = self.sigreg(predicted.transpose(0, 1))
             reconstruction_loss = 0
-
+    
         reward_loss = 0
         if self.with_reward_prediction:
-            reward_targets = one_step_rewards_seq.reshape(-1)
-            reward_predictions = predicted_rewards.reshape(-1)
-            one_step_reward_loss = F.mse_loss(
-                reward_predictions, reward_targets
-            )
-            autoregressive_reward_predictions = torch.stack(
-                autoregressive_reward_predictions, dim=1
-            )
-            autoregressive_reward_targets = torch.stack(
-                autoregressive_reward_targets, dim=1
-            )
-            autoregressive_reward_loss = F.mse_loss(
-                autoregressive_reward_predictions,
-                autoregressive_reward_targets,
-            )
-            all_reward_predictions = torch.cat(
-                [
-                    reward_predictions,
-                    autoregressive_reward_predictions.reshape(-1),
-                ]
-            )
-            all_reward_targets = torch.cat(
-                [
-                    reward_targets,
-                    autoregressive_reward_targets.reshape(-1),
-                ]
-            )
-            reward_loss = F.mse_loss(
-                all_reward_predictions, all_reward_targets
-            )
-            with torch.no_grad():
-                def reward_metrics(predictions, targets):
-                    predictions = predictions.reshape(-1)
-                    targets = targets.reshape(-1)
-                    centered_predictions = (
-                        predictions - predictions.mean()
-                    )
-                    centered_targets = targets - targets.mean()
-                    correlation = (
-                        centered_predictions * centered_targets
-                    ).mean() / (
-                        centered_predictions.square().mean().sqrt()
-                        * centered_targets.square().mean().sqrt()
-                        + 1e-8
-                    )
-                    mse = F.mse_loss(predictions, targets)
-                    return mse, correlation
-
-                (
-                    one_step_reward_mse,
-                    one_step_reward_correlation,
-                ) = reward_metrics(
-                    reward_predictions, reward_targets
-                )
-                (
-                    autoregressive_reward_mse,
-                    autoregressive_reward_correlation,
-                ) = reward_metrics(
-                    autoregressive_reward_predictions,
-                    autoregressive_reward_targets,
-                )
-                reward_mse_metric, reward_correlation = reward_metrics(
-                    all_reward_predictions, all_reward_targets
-                )
-        
+            rewards_seq     = rewards_seq.reshape(-1, 1)
+            reward_loss     = (rewards_seq - predicted_rewards) .pow(2).mean()
+            
         terminal_loss = 0
         if self.with_terminal_prediction:
-            terminals_seq = one_step_terminals_seq.reshape(-1, 1).float()
-            terminal_loss = F.binary_cross_entropy(
-                predicted_terminals.reshape(-1, 1), terminals_seq
-            )
-
-
+            terminals_seq       = terminals_seq.reshape(-1, 1).float()
+            terminal_loss       = F.binary_cross_entropy(predicted_terminals, terminals_seq) 
+    
         total_loss  = (
             pred_loss
             + self.lambd_sigreg * sigreg_loss
             + self.lambd_reconstruction * reconstruction_loss
-            + self.lambd_reward * reward_loss
+            + reward_loss
             + terminal_loss
         )
         loss_dict   = dict(pred_loss=pred_loss, sigreg_loss=sigreg_loss)
         if self.fsq_encoder:
             loss_dict["categorical_loss"] = categorical_loss
-            loss_dict["latent_mse_metric"] = latent_mse_metric
             loss_dict["reconstruction_loss"] = reconstruction_loss
-            loss_dict["autoregressive_loss"] = autoregressive_loss
-            loss_dict["autoregressive_code_accuracy"] = autoregressive_code_accuracy
         if self.with_reward_prediction:
             loss_dict["rew_loss"] = reward_loss
-            loss_dict["one_step_reward_loss"] = one_step_reward_loss
-            loss_dict["autoregressive_reward_loss"] = autoregressive_reward_loss
-            loss_dict["one_step_reward_mse"] = one_step_reward_mse
-            loss_dict["one_step_reward_correlation"] = one_step_reward_correlation
-            loss_dict["autoregressive_reward_mse"] = autoregressive_reward_mse
-            loss_dict["autoregressive_reward_correlation"] = autoregressive_reward_correlation
-            loss_dict["reward_mse_metric"] = reward_mse_metric
-            loss_dict["reward_correlation"] = reward_correlation
-        
+            
         if self.with_terminal_prediction:
             loss_dict["term_loss"] = terminal_loss
-
-        return total_loss, loss_dict 
     
-#######################################################################################
-    def _get_sequences(self, key, indices, sequence_length):
-        values = self.dataset[key]
-        if key == "states" and "next_states" in self.dataset:
-            next_states = self.dataset["next_states"]
-            sequences = []
-            for start in indices:
-                prefix = values[start:start + sequence_length - 1]
-                final_next_state = next_states[
-                    start + sequence_length - 2
-                ]
-                if torch.is_tensor(values):
-                    sequence = torch.cat(
-                        [prefix, final_next_state.unsqueeze(0)], dim=0
-                    )
-                else:
-                    sequence = np.concatenate(
-                        [prefix, final_next_state[None]], axis=0
-                    )
-                sequences.append(sequence)
-        else:
-            sequences = [
-                values[start:start + sequence_length - 1]
-                for start in indices
-            ]
-        if torch.is_tensor(values):
-            return torch.stack(sequences).to(self.device)
-        return torch.as_tensor(
-            np.asarray(sequences), device=self.device
-        )
-
-#######################################################################################
-    def _run_batches(self, indices, batch_size, training):
-        sequence_length = (
-            self.max_seq_length + self.autoregressive_rollout_length
-        )
-        num_batches = int(np.ceil(len(indices) / batch_size))
-        losses = dict(total_loss=0)
-
-        for mini_b in range(num_batches):
-            mini_b_indices = indices[
-                mini_b * batch_size:mini_b * batch_size + batch_size
-            ]
-            states = self._get_sequences(
-                "states", mini_b_indices, sequence_length
-            )
-            actions = self._get_sequences(
-                "actions", mini_b_indices, sequence_length
-            )
-            rewards = None
-            if self.with_reward_prediction:
-                rewards = self._get_sequences(
-                    "rewards", mini_b_indices, sequence_length
-                ).unsqueeze(-1)
-            terminals = None
-            if self.with_terminal_prediction:
-                terminals = self._get_sequences(
-                    "terminals", mini_b_indices, sequence_length
-                ).unsqueeze(-1)
-
-            total_loss, loss_dict = self.train_step(
-                states, actions, rewards, terminals
-            )
-            for key, value in loss_dict.items():
-                if key not in losses:
-                    losses[key] = 0
-                losses[key] += (
-                    value.detach() if torch.is_tensor(value) else value
-                )
-            losses["total_loss"] += total_loss.detach()
-
-            if training:
-                self.optimizer.zero_grad()
-                total_loss.backward()
-                self.optimizer.step()
-
-        return {
-            key: value / num_batches for key, value in losses.items()
-        }
+        return total_loss, loss_dict  
 
 #######################################################################################
     def train_epoch(self, batch_size):
-        num_batches = int(np.ceil(
-            len(self.valid_sequence_starts) / batch_size
-        ))
-        num_samples = len(self.valid_sequence_starts)
-        terminal_samples = (
-            int(num_samples * self.reward_priority_fraction / 2)
-            if len(self.terminal_sequence_starts) > 0 else 0
-        )
-        high_reward_samples = (
-            int(num_samples * self.reward_priority_fraction / 2)
-            if len(self.high_reward_sequence_starts) > 0 else 0
-        )
-        regular_samples = (
-            num_samples - terminal_samples - high_reward_samples
-        )
-        sampled_indices = [
-            np.random.choice(
-                self.valid_sequence_starts,
-                size=regular_samples,
-                replace=regular_samples > len(self.valid_sequence_starts),
-            )
-        ]
-        if terminal_samples:
-            sampled_indices.append(np.random.choice(
-                self.terminal_sequence_starts,
-                size=terminal_samples,
-                replace=terminal_samples > len(self.terminal_sequence_starts),
-            ))
-        if high_reward_samples:
-            sampled_indices.append(np.random.choice(
-                self.high_reward_sequence_starts,
-                size=high_reward_samples,
-                replace=high_reward_samples > len(self.high_reward_sequence_starts),
-            ))
-        random_indices = np.concatenate(sampled_indices)
-        np.random.shuffle(random_indices)
-        return self._run_batches(random_indices, batch_size, training=True)
+        dataset_length  = self.dataset["states"].shape[0] - self.max_seq_length - 1
+        num_batches     = int(np.ceil(dataset_length / batch_size)) 
+
+        random_indices  = np.random.choice(np.arange(dataset_length), replace=False, size=np.arange(dataset_length).shape)
+        
+        losses = dict(total_loss=0)
+        for mini_b in range(num_batches):
+            mini_b_indices              = random_indices[mini_b * batch_size: mini_b * batch_size + batch_size]
+
+            mini_b_states_sequences         = torch.tensor(np.asarray([self.dataset["states"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+            mini_b_actions_sequences        = torch.tensor(np.asarray([self.dataset["actions"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+            mini_b_rewards_sequences        = None
+            if self.with_reward_prediction:
+                mini_b_rewards_sequences    = torch.tensor(np.asarray([self.dataset["rewards"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+                mini_b_rewards_sequences    = mini_b_rewards_sequences.unsqueeze(-1)
+            mini_b_terminals_sequences      = None
+            # TODO: This probably needs to be balanced, the states with False are much more than states with True
+            if self.with_terminal_prediction:
+                mini_b_terminals_sequences  = torch.tensor(np.asarray([self.dataset["terminals"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+                mini_b_terminals_sequences  = mini_b_terminals_sequences.unsqueeze(-1)
+
+            total_loss, loss_dict       = self.train_step(mini_b_states_sequences, mini_b_actions_sequences, mini_b_rewards_sequences, mini_b_terminals_sequences)
+            for key in loss_dict.keys():
+                if key not in losses:
+                    losses[key] = 0 
+                
+                losses[key] += loss_dict[key]
+
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            self.optimizer.step()
+
+            losses["total_loss"] += total_loss
+        
+        for key in losses.keys():
+            losses[key] /= num_batches
+        
+        return losses
 
 #######################################################################################
     def validate_epoch(self, batch_size):

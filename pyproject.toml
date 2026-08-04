@@ -1,5 +1,5 @@
 [project]
-name = "latent_fsq"
+name = "pidm_fsq"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
