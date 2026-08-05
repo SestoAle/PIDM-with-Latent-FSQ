@@ -33,6 +33,7 @@ def create_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_o
         # This world model will be feature based
         with_reward_prediction=False,
         with_terminal_prediction=False,
+        with_action=False,
         feature_base=True,
         fsq_input_size=fsq_input_size,
         fsq_output_size=fsq_output_size,

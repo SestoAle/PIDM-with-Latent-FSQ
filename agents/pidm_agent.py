@@ -13,6 +13,7 @@ class PIDMAgent(nn.Module):
                  action_size : int, 
                  policy_arch : nn.Module, 
                  lr : float,
+                 device : str = "cpu",
                  **kwargs):
         super(PIDMAgent, self).__init__()
 
@@ -22,13 +23,15 @@ class PIDMAgent(nn.Module):
         self.lr = lr
 
         self.policy = policy_arch(state_size)
-
-        self.action_head = self.linear(self.policy.output_size, action_size)
-
+        self.action_head = nn.Linear(self.policy.output_dim, action_size)
         self.optimizer = AdamW(self.parameters(), self.lr)
+        self.device = device
+
+        self.to(device)
 
 ###########################################################################################
     def forward(self, x):
+        x = torch.concatenate(x, dim=-1).float()
         emb = self.policy(x)
         action = self.action_head(emb)
 
@@ -63,7 +66,7 @@ class PIDMAgent(nn.Module):
 
         dataset_length = self.states.shape[0]
         num_batches = int(np.ceil(dataset_length / batch_size))
-        random_indices = np.random.choice(np.aranage(dataset_length), dataset_length, False)
+        random_indices = np.random.choice(np.arange(dataset_length), dataset_length, False)
 
         losses = []
 
@@ -74,11 +77,12 @@ class PIDMAgent(nn.Module):
             mb_actions = self.actions[mb_indices]
             mb_next_states = self.next_states[mb_indices]
 
-            loss = self.train_epoch([mb_states, mb_actions, mb_next_states])
+            loss = self.train_step([mb_states, mb_actions, mb_next_states])
             losses.append(loss.detach().cpu().numpy())
 
         epoch_loss = np.mean(losses)
-        return epoch_loss
+        loss = dict(total_loss=epoch_loss)
+        return loss
 
 #######################################################################################
     def save_model(self, name=None, folder='saved'):

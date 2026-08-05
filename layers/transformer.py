@@ -200,7 +200,7 @@ class Transformer(nn.Module):
         if self.with_adaln:
             return inp, c, original_mask
         else:
-            return inp, original_mask
+            return inp, None, original_mask
     
     def entity_max_pooling_masked(self, inp, mask):
         mask = torch.unsqueeze(mask, -1)

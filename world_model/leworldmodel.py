@@ -130,6 +130,8 @@ class LeWorldModel(nn.Module):
                  # With terminal and reward output
                  with_reward_prediction : bool = False,
                  with_terminal_prediction : bool = False,
+                 # If this is a state-only model
+                 with_action : bool = True,
                  # If it is feature base, we have FSQ hyperparameters
                  fsq_output_size : int = 256,
                  fsq_input_size : int = 256,
@@ -162,6 +164,7 @@ class LeWorldModel(nn.Module):
         self.with_terminal_prediction   = with_terminal_prediction
         self.with_reward_prediction     = with_reward_prediction
         self.fsq_encoder                = fsq_encoder
+        self.with_action                = with_action 
 
         # Sigreg is only for continuous latent space
         self.sigreg                 = SIGReg()
@@ -217,7 +220,7 @@ class LeWorldModel(nn.Module):
                 with_embeddings=False,
                 post_norm=True,
                 pre_norm=True,
-                with_adaln=True,
+                with_adaln=self.with_action,
                 adaln_input_size=action_dim,
                 is_causal=True,
                 device=device
@@ -277,10 +280,12 @@ class LeWorldModel(nn.Module):
         emb = torch.concat([cls_tkns, emb], dim=1)
         # Add positional encoding
         emb = emb + self.position_embedding
-        emb, _ = self.encoder_trans([emb, None, None])
+        emb, _, _ = self.encoder_trans([emb, None, None])
         emb = emb[:, 0, :]
         emb = rearrange(emb, "(bs seq) h -> bs seq h", bs=bs, seq=seq)
 
+        # This may be unnecessary, but just to be sure
+        action_seq = action_seq if self.with_action else None
         emb, _, _ = self.predictor([emb, action_seq, None])
         bs = emb.shape[0]
         emb = rearrange(emb, "bs t f -> (bs t) f")
