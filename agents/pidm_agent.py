@@ -14,6 +14,7 @@ class PIDMAgent(nn.Module):
                  policy_arch : nn.Module, 
                  lr : float,
                  device : str = "cpu",
+                 only_real_states : bool = False,
                  **kwargs):
         super(PIDMAgent, self).__init__()
 
@@ -21,6 +22,7 @@ class PIDMAgent(nn.Module):
         self.action_size = action_size
         self.state_size = state_size
         self.lr = lr
+        self.only_real_states = only_real_states
 
         self.policy = policy_arch(state_size)
         self.action_head = nn.Linear(self.policy.output_dim, action_size)
@@ -31,9 +33,12 @@ class PIDMAgent(nn.Module):
 
 ###########################################################################################
     def forward(self, x):
-        x = torch.concatenate(x, dim=-1).float()
+        if self.only_real_states:
+            x = x[0]
+        else:
+            x = torch.concatenate(x, dim=-1).float()
         emb = self.policy(x)
-        action = self.action_head(emb)
+        action = F.tanh(self.action_head(emb))
 
         return action
 

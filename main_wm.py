@@ -5,7 +5,6 @@ import os
 import numpy as np
 
 from world_model.leworldmodel import LeWorldModel
-from einops import rearrange
 from colorama import Fore, Style, init
 from torch.nn import functional as F
 from envs.gym_env import GymEnv
@@ -154,14 +153,15 @@ if __name__ == "__main__":
     parser.add_argument('-dn', '--dataset-name', help="The name of the precollected dataset with which we train the world model", default="datasets/dataset.pkl")
     parser.add_argument('-as', '--action-size', help="The action dimension of the env", default=2, type=int)
     parser.add_argument('-is', '--input-size', help="The state dimension of the env", default=8, type=int)
-    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=64, type=int)
-    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=8, type=int)
+    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=16, type=int)
+    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=14, type=int)
     parser.add_argument('-fs', '--fixed-seed', help="If we want to use a fixed seed", default=423, type=int)
-    parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=4, type=int)
+    parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=8, type=int)
     parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=1024, type=int)
     parser.add_argument('-en', '--epochs-number', help="The number of epochs during training", default=5, type=int)
-    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-3, type=float)
+    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-4, type=float)
     parser.add_argument('-vi', '--visualize-inference', help="If we want to see the agent in the environment", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('-wf', '--without-fsq', help="If we want to run an ablation without fsq", action=argparse.BooleanOptionalAction, default=False)
 
     args = parser.parse_args()
 
@@ -169,7 +169,16 @@ if __name__ == "__main__":
     print("####")
     print(Fore.CYAN + "Creating the model.." + Style.RESET_ALL)
     print("...")
-    model = create_model(args.action_size, args.sequence_length, args.learning_rate, fsq_input_size=args.input_size, fsq_output_size=args.encoder_dim, L=args.levels_dim, device=device)
+    model = create_model(
+        action_size=args.action_size, 
+        sequence_length=args.sequence_length, 
+        lr=args.learning_rate, 
+        fsq_input_size=args.input_size, 
+        fsq_output_size=args.encoder_dim, 
+        L=args.levels_dim, 
+        device=device,
+        mlp_encoder=args.without_fsq
+        )
     loaded, evaluate = check_if_model_exists(args.model_name, model)
     print(Fore.GREEN + "Model created!" + Style.RESET_ALL)
     print("####")

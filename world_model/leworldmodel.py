@@ -97,7 +97,10 @@ class MLPEncoder(torch.nn.Module):
 
         self.linear_latent = nn.Sequential(
             nn.Linear(input_size, output_size),
-            nn.Tanh()
+            nn.ReLU(),
+            nn.Linear(output_size, output_size),
+            nn.ReLU(),
+            nn.Linear(output_size, output_size),
         )
     
     def forward(self, x):
@@ -123,7 +126,7 @@ class LeWorldModel(nn.Module):
                  teacher_forcing_probability : float = 0.5,
                  autoregressive_loss_weight : float = 1.0,
                  encoder_hidden_dim : int = 192,
-                 num_heads : int = 16,
+                 num_heads : int = 4,
                  num_decoder_layers : int = 6,
                  device : str = "cpu", 
                  feature_base : bool = False,
@@ -231,7 +234,7 @@ class LeWorldModel(nn.Module):
             # Plus the same projection head that we have for the encoder
             self.predictor_head     = nn.Sequential(
                 nn.Linear(in_features=self.encoder_hidden_dim, out_features=self.encoder_hidden_dim),
-                nn.BatchNorm1d(self.encoder_hidden_dim)
+                nn.LayerNorm(self.encoder_hidden_dim)
             )
         else:
             # A projection over 8 possible values for dim
@@ -265,24 +268,28 @@ class LeWorldModel(nn.Module):
 #######################################################################################
     def predictor_fwd(self, x, deterministic=True):
         state_seq, action_seq, _ = x
+        # The state sequences is already embedded
         bs, seq = state_seq.shape[:2]
 
-        # Embed the FSQ codes
-        if len(state_seq.shape) > 2:
-            state_seq = rearrange(state_seq, "bs seq f -> (bs seq) f")
+        if self.fsq_encoder:
+            # Embed the FSQ codes
+            if len(state_seq.shape) > 2:
+                state_seq = rearrange(state_seq, "bs seq f -> (bs seq) f")
 
-        # Encode the sequence with FSQ
-        emb = self.encoder_emb(state_seq.long())
+            # Encode the sequence with FSQ
+            emb = self.encoder_emb(state_seq.long())
 
-        # Time-based transformer
-        # Add a CLS token
-        cls_tkns = torch.repeat_interleave(self.cls_tkn.view(1, -1), emb.shape[0], dim=0).view(emb.shape[0], 1, -1)
-        emb = torch.concat([cls_tkns, emb], dim=1)
-        # Add positional encoding
-        emb = emb + self.position_embedding
-        emb, _, _ = self.encoder_trans([emb, None, None])
-        emb = emb[:, 0, :]
-        emb = rearrange(emb, "(bs seq) h -> bs seq h", bs=bs, seq=seq)
+            # Time-based transformer
+            # Add a CLS token
+            cls_tkns = torch.repeat_interleave(self.cls_tkn.view(1, -1), emb.shape[0], dim=0).view(emb.shape[0], 1, -1)
+            emb = torch.concat([cls_tkns, emb], dim=1)
+            # Add positional encoding
+            emb = emb + self.position_embedding
+            emb, _, _ = self.encoder_trans([emb, None, None])
+            emb = emb[:, 0, :]
+            emb = rearrange(emb, "(bs seq) h -> bs seq h", bs=bs, seq=seq)
+        else:
+            emb = state_seq
 
         # This may be unnecessary, but just to be sure
         action_seq = action_seq if self.with_action else None
@@ -348,6 +355,9 @@ class LeWorldModel(nn.Module):
 
             emb = rearrange(quantized_values, "(bs seq) h -> bs seq h", bs=bs)
 
+        if return_quantized:
+            return emb, None
+        
         return emb
 
 #######################################################################################
@@ -371,7 +381,7 @@ class LeWorldModel(nn.Module):
 #######################################################################################
     def train_step(self, states_seq, actions_seq, rewards_seq=None, terminals_seq=None):
     
-        latents                                                                     = self.encoder_fwd(states_seq)
+        latents, quantized_values                                                   = self.encoder_fwd(states_seq, return_quantized=True)
         predicted, predicted_logits, predicted_rewards, predicted_terminals         = self.predictor_fwd([latents[:, :-1], actions_seq[:, :-1], None], deterministic=False)
         if rewards_seq is not None:
             rewards_seq                                                                 = rewards_seq[:, :-1]
@@ -386,8 +396,7 @@ class LeWorldModel(nn.Module):
     
             pred_loss           = categorical_loss
     
-            shifted_latents         = self.encoder.shift_and_scale(latents)
-            reconstructed_states    = self.reconstruction_head(shifted_latents)
+            reconstructed_states    = self.reconstruction_head(quantized_values)
             reconstruction_loss     = F.smooth_l1_loss(reconstructed_states, states_seq.float())
             sigreg_loss             = 0
         else:
