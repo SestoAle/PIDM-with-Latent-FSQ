@@ -20,6 +20,7 @@ def create_env(seed, visualize_inference):
     )
     return env
 
+
 #######################################################################################
 def create_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_output_size, L, mlp_encoder=False):
     model = LeWorldModel(

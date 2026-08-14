@@ -10,6 +10,7 @@ from architectures.mlp_based_pidm import PolicyEmbedding
 from architectures.mlp_based_policy import PolicyEmbedding as SacPolicy, CriticEmbedding as SacCritic
 from envs.gym_env import GymEnv
 from agents.sac_agent import SACAgent
+from sklearn.metrics.pairwise import pairwise_distances
 
 from colorama import Fore, Style, init
 
@@ -97,6 +98,24 @@ def create_agent(state_size, action_size, policy_arch, lr, device, only_real_sta
     return agent
 
 #######################################################################################
+def get_next_state_through_search(state, dataset):
+    # Given a state, get the closest next state in the dataset.
+    # Similar to what the microsoft paper does
+
+    # The dataset is a list of transitions
+    all_states = np.asarray(dataset["states"])
+    feature_size = all_states.shape[1]
+
+    state = np.asarray(state).reshape(1, feature_size)
+
+    # Get the distance
+    distances = pairwise_distances(state, all_states)
+    min_distance_index = np.argmin(distances)
+    closest_next_state = dataset["next_states"][min_distance_index]
+
+    return closest_next_state
+
+#######################################################################################
 def create_world_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_output_size, L, model_name, mlp_encoder=False):
     model = LeWorldModel(
         action_dim=action_size,
@@ -153,6 +172,9 @@ def load_and_set_dataset(
     new_dataset["terminals"] = np.asarray(new_dataset["terminals"])
 
     print(f"This dataset has a total of {new_dataset["states"].shape[0]} transitions")
+
+    import ipdb; ipdb.set_trace()
+    get_next_state_through_search(new_dataset["states"][234], new_dataset)
 
     if world_model is not None:
         world_model.set_dataset(new_dataset)
