@@ -125,6 +125,7 @@ class LeWorldModel(nn.Module):
                  autoregressive_rollout_length : int = 5,
                  teacher_forcing_probability : float = 0.5,
                  autoregressive_loss_weight : float = 1.0,
+                 prediction_horizon : int = 1,
                  encoder_hidden_dim : int = 192,
                  num_heads : int = 4,
                  num_decoder_layers : int = 6,
@@ -159,6 +160,9 @@ class LeWorldModel(nn.Module):
         self.autoregressive_rollout_length = autoregressive_rollout_length
         self.teacher_forcing_probability = teacher_forcing_probability
         self.autoregressive_loss_weight = autoregressive_loss_weight
+        if prediction_horizon < 1:
+            raise ValueError("prediction_horizon must be at least 1")
+        self.prediction_horizon         = prediction_horizon
         self.lr                         = lr
         self.feature_base               = feature_base
         self.fsq_output_size            = fsq_output_size
@@ -363,10 +367,6 @@ class LeWorldModel(nn.Module):
 #######################################################################################
     def set_dataset(self, dataset):
         # We assume the dataset is a dict of states, actions, rewards, next_states
-        # TODO: This does not take into account the ending of sequences. 
-        # Not sure it really matters for this small project, but it is something
-        # to keep in mind
-
         self.dataset                = dataset
 
         for key in self.dataset.keys():
@@ -377,18 +377,60 @@ class LeWorldModel(nn.Module):
 
             if not isinstance(self.dataset[key], np.ndarray):
                 self.dataset[key]   = np.asarray(self.dataset[key])
+
+    def get_valid_sequence_starts(self):
+        """Return starts for context/target windows that stay within an episode."""
+        window_length = self.max_seq_length + self.prediction_horizon
+        dataset_length = self.dataset["states"].shape[0]
+        number_of_starts = dataset_length - window_length + 1
+        if number_of_starts <= 0:
+            raise ValueError(
+                "The dataset is too short for max_seq_length="
+                f"{self.max_seq_length} and prediction_horizon="
+                f"{self.prediction_horizon}."
+            )
+
+        starts = np.arange(number_of_starts)
+        terminals = self.dataset.get("terminals")
+        if terminals is None:
+            return starts
+
+        if torch.is_tensor(terminals):
+            terminals = terminals.detach().cpu().numpy()
+        terminals = np.asarray(terminals, dtype=bool).reshape(-1)
+
+        # A terminal at any transition before the last state in the window means
+        # the window crosses into a different episode.
+        valid_starts = np.asarray([
+            start for start in starts
+            if not terminals[start:start + window_length - 1].any()
+        ], dtype=np.int64)
+
+        if len(valid_starts) == 0:
+            raise ValueError(
+                "No training sequence can fit within an episode for "
+                f"max_seq_length={self.max_seq_length} and "
+                f"prediction_horizon={self.prediction_horizon}."
+            )
+        return valid_starts
             
 #######################################################################################
     def train_step(self, states_seq, actions_seq, rewards_seq=None, terminals_seq=None):
-    
+        k = self.prediction_horizon
+        if states_seq.shape[1] <= k:
+            raise ValueError(
+                f"A sequence of length {states_seq.shape[1]} cannot provide "
+                f"targets for prediction_horizon={k}."
+            )
+
         latents, quantized_values                                                   = self.encoder_fwd(states_seq, return_quantized=True)
-        predicted, predicted_logits, predicted_rewards, predicted_terminals         = self.predictor_fwd([latents[:, :-1], actions_seq[:, :-1], None], deterministic=False)
+        predicted, predicted_logits, predicted_rewards, predicted_terminals         = self.predictor_fwd([latents[:, :-k], actions_seq[:, :-k], None], deterministic=False)
         if rewards_seq is not None:
-            rewards_seq                                                                 = rewards_seq[:, :-1]
+            rewards_seq                                                                 = rewards_seq[:, :-k]
         if terminals_seq is not None:
-            terminals_seq                                                               = terminals_seq[:, :-1]
+            terminals_seq                                                               = terminals_seq[:, :-k]
     
-        labels      = latents[:, 1:]
+        labels      = latents[:, k:]
     
         if self.fsq_encoder:
             categorical_logits  = rearrange(predicted_logits, "bs t f d -> (bs t f) d")
@@ -435,25 +477,25 @@ class LeWorldModel(nn.Module):
 
 #######################################################################################
     def train_epoch(self, batch_size):
-        dataset_length  = self.dataset["states"].shape[0] - self.max_seq_length - 1
-        num_batches     = int(np.ceil(dataset_length / batch_size)) 
-
-        random_indices  = np.random.choice(np.arange(dataset_length), replace=False, size=np.arange(dataset_length).shape)
+        sequence_starts = self.get_valid_sequence_starts()
+        num_batches     = int(np.ceil(len(sequence_starts) / batch_size))
+        random_indices  = np.random.permutation(sequence_starts)
+        window_length   = self.max_seq_length + self.prediction_horizon
         
         losses = dict(total_loss=0)
         for mini_b in range(num_batches):
             mini_b_indices              = random_indices[mini_b * batch_size: mini_b * batch_size + batch_size]
 
-            mini_b_states_sequences         = torch.tensor(np.asarray([self.dataset["states"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
-            mini_b_actions_sequences        = torch.tensor(np.asarray([self.dataset["actions"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+            mini_b_states_sequences         = torch.tensor(np.asarray([self.dataset["states"][b:b+window_length] for b in mini_b_indices])).to(self.device)
+            mini_b_actions_sequences        = torch.tensor(np.asarray([self.dataset["actions"][b:b+window_length] for b in mini_b_indices])).to(self.device)
             mini_b_rewards_sequences        = None
             if self.with_reward_prediction:
-                mini_b_rewards_sequences    = torch.tensor(np.asarray([self.dataset["rewards"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+                mini_b_rewards_sequences    = torch.tensor(np.asarray([self.dataset["rewards"][b:b+window_length] for b in mini_b_indices])).to(self.device)
                 mini_b_rewards_sequences    = mini_b_rewards_sequences.unsqueeze(-1)
             mini_b_terminals_sequences      = None
             # TODO: This probably needs to be balanced, the states with False are much more than states with True
             if self.with_terminal_prediction:
-                mini_b_terminals_sequences  = torch.tensor(np.asarray([self.dataset["terminals"][b:b+self.max_seq_length+1] for b in mini_b_indices])).to(self.device)
+                mini_b_terminals_sequences  = torch.tensor(np.asarray([self.dataset["terminals"][b:b+window_length] for b in mini_b_indices])).to(self.device)
                 mini_b_terminals_sequences  = mini_b_terminals_sequences.unsqueeze(-1)
 
             total_loss, loss_dict       = self.train_step(mini_b_states_sequences, mini_b_actions_sequences, mini_b_rewards_sequences, mini_b_terminals_sequences)
@@ -497,7 +539,11 @@ class LeWorldModel(nn.Module):
 
 #######################################################################################
     def save_model(self, name=None, folder='saved'):
-        torch.save(self.state_dict(), '{}/{}'.format(folder, name))
+        checkpoint = {
+            "state_dict": self.state_dict(),
+            "prediction_horizon": self.prediction_horizon,
+        }
+        torch.save(checkpoint, '{}/{}'.format(folder, name))
         print("Model saved succesfully!")
 
 #######################################################################################
@@ -506,6 +552,14 @@ class LeWorldModel(nn.Module):
             '{}/{}'.format(folder, name),
             map_location=torch.device(self.device)
         )
+        if "state_dict" in checkpoint:
+            saved_horizon = checkpoint.get("prediction_horizon", 1)
+            if saved_horizon != self.prediction_horizon:
+                raise ValueError(
+                    f"Checkpoint was trained with prediction_horizon={saved_horizon}, "
+                    f"but the model was created with prediction_horizon={self.prediction_horizon}."
+                )
+            checkpoint = checkpoint["state_dict"]
         try:
             self.load_state_dict(checkpoint)
         except RuntimeError:

@@ -3,6 +3,7 @@ import torch
 import pickle
 import os
 import numpy as np
+from collections import deque
 
 from world_model.leworldmodel import LeWorldModel
 from agents.pidm_agent import PIDMAgent
@@ -25,13 +26,14 @@ def create_env():
     return env
 
 #######################################################################################
-def evaluate_agent(env, agent, world_model, horizon, eval_episodes=100, only_real_states=False):
+def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes=100, only_real_states=False):
 
     episode_rewards = []
     with torch.no_grad():
         for episode in range(eval_episodes):
             if world_model is not None:
                 running_latent = torch.zeros(horizon, world_model.encoder_hidden_dim).to(device)
+                pending_predictions = deque()
 
             state = env.reset()
             done = False
@@ -46,6 +48,11 @@ def evaluate_agent(env, agent, world_model, horizon, eval_episodes=100, only_rea
                 state = torch.from_numpy(state).to(device)
                 step += 1
 
+                if dataset is not None:
+                    predicted_next_state, _ = get_next_state_through_search(state.numpy(), dataset)
+                    predicted_next_state = torch.from_numpy(predicted_next_state).to(device).view(1, -1)
+                    encoded_state = state.view(1, -1)
+
                 if world_model is not None:
                     # Update the running input and action
                     running_latent = torch.roll(running_latent, -1, 0)
@@ -53,33 +60,39 @@ def evaluate_agent(env, agent, world_model, horizon, eval_episodes=100, only_rea
                     running_latent[-1] = encoded_state
                     predicted_next_state = world_model.predictor_fwd([running_latent.view(1, horizon, -1), None, None])[0][-1, -1].unsqueeze(dim=0)
                     og_predicted_next_state = predicted_next_state.clone()
+                    pending_predictions.append(og_predicted_next_state)
 
                     # Run the agent
                     if world_model.fsq_encoder:
                         encoded_state = world_model.encoder.shift_and_scale(encoded_state)
                         predicted_next_state = world_model.encoder.shift_and_scale(predicted_next_state)
+
                 if only_real_states:
                     action = agent([state.view(1, -1), None])
                 else:
                     action = agent([encoded_state, predicted_next_state])
-                action = action.detach().cpu().numpy()[0]
 
+                action = action.detach().cpu().numpy()[0]
                 
                 next_state, reward, done, _ = env.step(action)
 
                 # Check how different the predicted and the real are
-                encoded_next_state = world_model.encoder_fwd(torch.from_numpy(next_state).to(device).view(1, 1, -1)).squeeze(0)
-                accuracy = (torch.sum(torch.stack([a == b for a, b in zip(og_predicted_next_state, encoded_next_state)])) / world_model.encoder_hidden_dim).item()
-                mean_accuracy += accuracy
-                accuracies.append(accuracy)
+                if world_model is not None:
+                    encoded_next_state = world_model.encoder_fwd(torch.from_numpy(next_state).to(device).view(1, 1, -1)).squeeze(0)
+                    if len(pending_predictions) >= world_model.prediction_horizon:
+                        due_prediction = pending_predictions.popleft()
+                        accuracy = (torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.encoder_hidden_dim).item()
+                        mean_accuracy += accuracy
+                        accuracies.append(accuracy)
 
                 state = next_state
                 episode_reward += reward
 
-            print(f"Mean accuracy for the world model: at episode {episode}: {mean_accuracy/step}")
+            mean_world_model_accuracy = mean_accuracy / len(accuracies) if accuracies else float("nan")
+            print(f"Mean accuracy for the world model: at episode {episode}: {mean_world_model_accuracy}")
             print(f"Episode reward at episode {episode}: {episode_reward}")
-            if episode_reward < 0:
-                import ipdb; ipdb.set_trace()
+            # if episode_reward < 0:
+            #     import ipdb; ipdb.set_trace()
             episode_rewards.append(episode_reward)
 
     print(f"Final performance over {eval_episodes} episodes: {np.mean(episode_rewards)}")
@@ -110,16 +123,18 @@ def get_next_state_through_search(state, dataset):
 
     # Get the distance
     distances = pairwise_distances(state, all_states)
-    min_distance_index = np.argmin(distances)
+    min_distance_index = np.argmin(distances.reshape(-1))
     closest_next_state = dataset["next_states"][min_distance_index]
+    closest_state = dataset["next_states"][min_distance_index]
 
-    return closest_next_state
+    return closest_next_state, closest_state
 
 #######################################################################################
-def create_world_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_output_size, L, model_name, mlp_encoder=False):
+def create_world_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, L, model_name, mlp_encoder=False):
     model = LeWorldModel(
         action_dim=action_size,
         max_seq_length=sequence_length,
+        prediction_horizon=prediction_horizon,
         encoder_hidden_dim=fsq_output_size,
         lr = lr,
         device=device,
@@ -173,9 +188,6 @@ def load_and_set_dataset(
 
     print(f"This dataset has a total of {new_dataset["states"].shape[0]} transitions")
 
-    import ipdb; ipdb.set_trace()
-    get_next_state_through_search(new_dataset["states"][234], new_dataset)
-
     if world_model is not None:
         world_model.set_dataset(new_dataset)
 
@@ -198,9 +210,12 @@ def load_and_set_dataset(
             # TODO: Do we do overlapping sequences?
             # TODO: Apparently, the state do not change that much in a sequence of 4 states
 
-            state_sequences = torch.zeros(encoded_states.shape[0]-horizon, horizon, encoded_states.shape[-1]).to(device)
-            for i in range(0, len(encoded_states) - horizon):
-                state_sequences[i] = encoded_states[i:i+horizon]
+            sequence_starts = world_model.get_valid_sequence_starts()
+            state_sequences = torch.stack([
+                encoded_states[start:start+horizon]
+                for start in sequence_starts
+            ])
+            current_indices = torch.from_numpy(sequence_starts + horizon - 1).to(device)
 
             predicted_next_states = world_model.predictor_fwd([state_sequences, None, None])[0][:, -1, :]
             if world_model.fsq_encoder:
@@ -208,8 +223,8 @@ def load_and_set_dataset(
                 predicted_next_states = world_model.encoder.shift_and_scale(predicted_next_states)
             encoded_next_states = predicted_next_states
 
-            encoded_states = encoded_states[horizon-1:-1]
-        actions = torch.from_numpy(new_dataset["actions"]).to(device)[horizon-1:-1]
+            encoded_states = encoded_states[current_indices]
+        actions = torch.from_numpy(new_dataset["actions"]).to(device)[current_indices]
 
     # encoded_next_states = world_model.encoder_fwd(torch.from_numpy(new_dataset["next_states"]).to(device)).squeeze()
     # encoded_next_states = world_model.encoder.shift_and_scale(encoded_next_states)
@@ -218,7 +233,7 @@ def load_and_set_dataset(
     # Set the dataset of the agent
 
     # ABLATION: Train with only real states
-    if only_real_states:
+    if world_model is None:
         agent.set_dataset(
             states=torch.from_numpy(new_dataset["states"]).to(device),
             actions=torch.from_numpy(new_dataset["actions"]).to(device),
@@ -230,6 +245,8 @@ def load_and_set_dataset(
             actions=actions,
             next_states=encoded_next_states
         )
+
+    return new_dataset
 
 #######################################################################################
 def train(epochs_number, batch_size, model, model_name):
@@ -281,8 +298,9 @@ if __name__ == "__main__":
     parser.add_argument('-as', '--action-size', help="The action dimension of the env", default=2, type=int)
     parser.add_argument('-is', '--input-size', help="The state dimension of the env", default=8, type=int)
     parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=16, type=int)
-    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=14, type=int)
+    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=12, type=int)
     parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=8, type=int)
+    parser.add_argument('-k', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
     parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=32, type=int)
     parser.add_argument('-en', '--epochs-number', help="The number of epochs during training", default=100, type=int)
     parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-3, type=float)
@@ -293,6 +311,7 @@ if __name__ == "__main__":
     # Ablations
     parser.add_argument('-rs', '--only-real-states', help="Wether to use only real states as input to the IL agent", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('-wf', '--without-fsq', help="If we want to run an ablation without fsq", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('-ws', '--with-search', help="If we want to use search instead of a world model", action=argparse.BooleanOptionalAction, default=False)
 
 
     args = parser.parse_args()
@@ -312,10 +331,11 @@ if __name__ == "__main__":
     loaded, evaluate = check_if_model_exists(args.model_name, agent)
     print(Fore.CYAN + "For this agent, we need a world model. Loading it now" + Style.RESET_ALL)
     world_model = None
-    if not args.only_real_states:
+    if not args.only_real_states and not args.with_search:
         world_model = create_world_model(
             action_size=args.action_size, 
             sequence_length=args.sequence_length, 
+            prediction_horizon=args.prediction_horizon,
             lr=args.world_model_learning_rate, 
             model_name=args.world_model_name,
             fsq_input_size=args.input_size, 
@@ -327,21 +347,23 @@ if __name__ == "__main__":
     print(Fore.GREEN + "Models created!" + Style.RESET_ALL)
     print("####")
 
-    if not evaluate:
-        print(Fore.CYAN + "Loading dataset..." + Style.RESET_ALL)
-        print("...")
-        load_and_set_dataset(
-            dataset_path=args.dataset_name,
-            world_model=world_model,
-            agent=agent,
-            world_model_batch_size=args.world_model_batch_size,
-            world_model_epochs=args.world_model_epochs_number,
-            horizon=args.sequence_length,
-            only_real_states=args.only_real_states
-        )
+    print(Fore.CYAN + "Loading dataset..." + Style.RESET_ALL)
+    print("...")
+    dataset = load_and_set_dataset(
+        dataset_path=args.dataset_name,
+        world_model=world_model,
+        agent=agent,
+        world_model_batch_size=args.world_model_batch_size,
+        world_model_epochs=args.world_model_epochs_number,
+        horizon=args.sequence_length,
+        only_real_states=args.only_real_states
+    )
 
-        print(Fore.GREEN + "Dataset loaded!" + Style.RESET_ALL)
-        print("####")
+    if not args.with_search:
+        dataset = None
+
+    print(Fore.GREEN + "Dataset loaded!" + Style.RESET_ALL)
+    print("####")
 
     if not evaluate:
         print(Fore.RED + "Start training!" + Style.RESET_ALL)
@@ -363,6 +385,7 @@ if __name__ == "__main__":
         agent=agent,
         world_model=world_model,
         horizon=args.sequence_length,
+        dataset=dataset,
         eval_episodes=100,
         only_real_states=args.only_real_states
     )

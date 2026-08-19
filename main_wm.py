@@ -3,6 +3,7 @@ import torch
 import pickle
 import os
 import numpy as np
+from collections import deque
 
 from world_model.leworldmodel import LeWorldModel
 from colorama import Fore, Style, init
@@ -22,10 +23,11 @@ def create_env(seed, visualize_inference):
 
 
 #######################################################################################
-def create_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_output_size, L, mlp_encoder=False):
+def create_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, L, mlp_encoder=False):
     model = LeWorldModel(
         action_dim=action_size,
         max_seq_length=sequence_length,
+        prediction_horizon=prediction_horizon,
         encoder_hidden_dim=fsq_output_size,
         lr = lr,
         device=device,
@@ -45,12 +47,13 @@ def create_model(action_size, sequence_length, lr, device, fsq_input_size, fsq_o
 
 #######################################################################################
 def evaluate_world_model(world_model, env, horizon, policy=None, num_episodes=100):
-    # This is basically one-step world model, so it should be pretty easy to evaluate
+    k = world_model.prediction_horizon
     with torch.no_grad():
         for e in range(num_episodes):
             state = env.reset()
             done = False
             accuracies = []
+            pending_predictions = deque()
 
             running_latent = torch.zeros(horizon, world_model.encoder_hidden_dim).to(device)
             running_action = torch.zeros(horizon, env.action_dim).to(device)
@@ -77,17 +80,20 @@ def evaluate_world_model(world_model, env, horizon, policy=None, num_episodes=10
                 running_latent[-1] = encoded_state
                 running_action[-1] = action
                 predicted_next_state = world_model.predictor_fwd([running_latent.view(1, horizon, -1), running_action.view(1, horizon, -1), None])[0][-1, -1]
+                pending_predictions.append(predicted_next_state)
 
                 # Encode the real next state
                 next_state = torch.from_numpy(next_state).to(device)
                 encoded_next_state = world_model.encoder_fwd(next_state.view(1, 1, -1))[-1, -1]
 
                 # Check how different the predicted and the real are
-                accuracy = torch.sum(torch.stack([a == b for a, b in zip(predicted_next_state, encoded_next_state)])) / world_model.encoder_hidden_dim
-                accuracies.append(accuracy.cpu().numpy())
+                if len(pending_predictions) >= k:
+                    due_prediction = pending_predictions.popleft()
+                    accuracy = torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.encoder_hidden_dim
+                    accuracies.append(accuracy.cpu().numpy())
                 state = next_state.cpu().numpy()
 
-            print(f"Average accuracy for episode {e}: {np.mean(accuracies)}")
+            print(f"Average {k}-step accuracy for episode {e}: {np.mean(accuracies)}")
 
 #######################################################################################
 def load_dataset(dataset_path, model):
@@ -95,12 +101,19 @@ def load_dataset(dataset_path, model):
     with open(dataset_path, "rb") as f:
         dataset = pickle.load(f)
 
-    new_dataset = {
-        "states": np.asarray(dataset["states"]),
-        "actions": np.asarray(dataset["actions"]),
-        "rewards": np.asarray(dataset["rewards"]),
-        "terminals": np.asarray(dataset["terminals"])
-    }
+    if isinstance(dataset, list):
+        new_dataset = dict(states=[], actions=[], rewards=[], terminals=[])
+        for trajectory in dataset:
+            for key in new_dataset:
+                new_dataset[key].extend(trajectory[key])
+        new_dataset = {key: np.asarray(value) for key, value in new_dataset.items()}
+    else:
+        new_dataset = {
+            "states": np.asarray(dataset["states"]),
+            "actions": np.asarray(dataset["actions"]),
+            "rewards": np.asarray(dataset["rewards"]),
+            "terminals": np.asarray(dataset["terminals"])
+        }
 
     # Standardize the reward
     new_dataset["rewards"] = (new_dataset["rewards"] - np.mean(new_dataset["rewards"])) / (np.std(new_dataset["rewards"]) + 1e-6)
@@ -155,9 +168,10 @@ if __name__ == "__main__":
     parser.add_argument('-as', '--action-size', help="The action dimension of the env", default=2, type=int)
     parser.add_argument('-is', '--input-size', help="The state dimension of the env", default=8, type=int)
     parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=16, type=int)
-    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=14, type=int)
+    parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=12, type=int)
     parser.add_argument('-fs', '--fixed-seed', help="If we want to use a fixed seed", default=423, type=int)
     parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=8, type=int)
+    parser.add_argument('-k', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
     parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=1024, type=int)
     parser.add_argument('-en', '--epochs-number', help="The number of epochs during training", default=5, type=int)
     parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-4, type=float)
@@ -173,6 +187,7 @@ if __name__ == "__main__":
     model = create_model(
         action_size=args.action_size, 
         sequence_length=args.sequence_length, 
+        prediction_horizon=args.prediction_horizon,
         lr=args.learning_rate, 
         fsq_input_size=args.input_size, 
         fsq_output_size=args.encoder_dim, 
@@ -180,6 +195,7 @@ if __name__ == "__main__":
         device=device,
         mlp_encoder=args.without_fsq
         )
+
     loaded, evaluate = check_if_model_exists(args.model_name, model)
     print(Fore.GREEN + "Model created!" + Style.RESET_ALL)
     print("####")
