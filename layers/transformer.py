@@ -162,6 +162,7 @@ class Transformer(nn.Module):
         
 
         if self.mlp is not None:
+            ffn_residual = a
             
             if self.with_adaln and c is not None:
                 a = modulate(a, shift_mlp, scale_mlp)
@@ -174,7 +175,7 @@ class Transformer(nn.Module):
                 a = gate_mlp * a
 
             if self.residual:
-                a = a + inp
+                a = a + ffn_residual
 
         inp = a
         if self.post_norm:

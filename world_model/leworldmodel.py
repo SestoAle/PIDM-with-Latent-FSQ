@@ -365,6 +365,10 @@ class LeWorldModel(nn.Module):
         return emb
 
 #######################################################################################
+    def reconstructor_fwd(self, latent):
+        return self.reconstruction_head(latent)
+
+#######################################################################################
     def set_dataset(self, dataset):
         # We assume the dataset is a dict of states, actions, rewards, next_states
         self.dataset                = dataset

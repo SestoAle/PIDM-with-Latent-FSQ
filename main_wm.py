@@ -23,12 +23,12 @@ def create_env(seed, visualize_inference):
 
 
 #######################################################################################
-def create_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, L, mlp_encoder=False):
+def create_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, encoder_dim, L, mlp_encoder=False):
     model = LeWorldModel(
         action_dim=action_size,
         max_seq_length=sequence_length,
         prediction_horizon=prediction_horizon,
-        encoder_hidden_dim=fsq_output_size,
+        encoder_hidden_dim=encoder_dim,
         lr = lr,
         device=device,
 
@@ -53,9 +53,11 @@ def evaluate_world_model(world_model, env, horizon, policy=None, num_episodes=10
             state = env.reset()
             done = False
             accuracies = []
+            mses = []
             pending_predictions = deque()
+            step = 0
 
-            running_latent = torch.zeros(horizon, world_model.encoder_hidden_dim).to(device)
+            running_latent = torch.zeros(horizon, world_model.fsq_output_size).to(device)
             running_action = torch.zeros(horizon, env.action_dim).to(device)
 
             while not done:
@@ -73,11 +75,15 @@ def evaluate_world_model(world_model, env, horizon, policy=None, num_episodes=10
                 # Encode the state
                 state = torch.from_numpy(state).to(device)
                 action = torch.from_numpy(action).to(device)
+                step += 1
                 # Update the running input and action
-                running_latent = torch.roll(running_latent, -1, 0)
                 running_action = torch.roll(running_action, -1, 0)
                 encoded_state = world_model.encoder_fwd(state.view(1, 1, -1))
-                running_latent[-1] = encoded_state
+                if step == 1:
+                    running_latent[:] = encoded_state
+                else:
+                    running_latent = torch.roll(running_latent, -1, 0)
+                    running_latent[-1] = encoded_state
                 running_action[-1] = action
                 predicted_next_state = world_model.predictor_fwd([running_latent.view(1, horizon, -1), running_action.view(1, horizon, -1), None])[0][-1, -1]
                 pending_predictions.append(predicted_next_state)
@@ -89,11 +95,14 @@ def evaluate_world_model(world_model, env, horizon, policy=None, num_episodes=10
                 # Check how different the predicted and the real are
                 if len(pending_predictions) >= k:
                     due_prediction = pending_predictions.popleft()
-                    accuracy = torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.encoder_hidden_dim
+                    accuracy = torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.fsq_output_size
+                    predicted_reconstruction_next_state = world_model.reconstructor_fwd(world_model.encoder.shift_and_scale(due_prediction))
+                    mses.append(F.mse_loss(predicted_reconstruction_next_state, next_state).detach().cpu().numpy())
                     accuracies.append(accuracy.cpu().numpy())
                 state = next_state.cpu().numpy()
 
             print(f"Average {k}-step accuracy for episode {e}: {np.mean(accuracies)}")
+            print(f"Average {k}-step reconstruction MSE for episode {e}: {np.mean(mses)}")
 
 #######################################################################################
 def load_dataset(dataset_path, model):
@@ -167,14 +176,15 @@ if __name__ == "__main__":
     parser.add_argument('-dn', '--dataset-name', help="The name of the precollected dataset with which we train the world model", default="datasets/dataset.pkl")
     parser.add_argument('-as', '--action-size', help="The action dimension of the env", default=2, type=int)
     parser.add_argument('-is', '--input-size', help="The state dimension of the env", default=8, type=int)
-    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=16, type=int)
+    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder", default=128, type=int)
+    parser.add_argument('-os', '--fsq-output-size', help="The dimension of the FSQ encoder", default=16, type=int)
     parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=12, type=int)
     parser.add_argument('-fs', '--fixed-seed', help="If we want to use a fixed seed", default=423, type=int)
     parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=8, type=int)
-    parser.add_argument('-k', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
-    parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=1024, type=int)
+    parser.add_argument('-ph', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
+    parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=256, type=int)
     parser.add_argument('-en', '--epochs-number', help="The number of epochs during training", default=5, type=int)
-    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-4, type=float)
+    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=5e-5, type=float)
     parser.add_argument('-vi', '--visualize-inference', help="If we want to see the agent in the environment", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('-wf', '--without-fsq', help="If we want to run an ablation without fsq", action=argparse.BooleanOptionalAction, default=False)
 
@@ -189,8 +199,9 @@ if __name__ == "__main__":
         sequence_length=args.sequence_length, 
         prediction_horizon=args.prediction_horizon,
         lr=args.learning_rate, 
+        encoder_dim=args.encoder_dim,
         fsq_input_size=args.input_size, 
-        fsq_output_size=args.encoder_dim, 
+        fsq_output_size=args.fsq_output_size, 
         L=args.levels_dim, 
         device=device,
         mlp_encoder=args.without_fsq

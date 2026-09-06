@@ -26,13 +26,13 @@ def create_env():
     return env
 
 #######################################################################################
-def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes=100, only_real_states=False):
+def evaluate_agent(env, agent, world_model, horizon, prediction_horizon=1, dataset=None, eval_episodes=100, only_real_states=False, deterministic_wm=True, with_reconstruction=False):
 
     episode_rewards = []
     with torch.no_grad():
         for episode in range(eval_episodes):
             if world_model is not None:
-                running_latent = torch.zeros(horizon, world_model.encoder_hidden_dim).to(device)
+                running_latent = torch.zeros(horizon, world_model.fsq_output_size).to(device)
                 pending_predictions = deque()
 
             state = env.reset()
@@ -49,16 +49,23 @@ def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes
                 step += 1
 
                 if dataset is not None:
-                    predicted_next_state, _ = get_next_state_through_search(state.numpy(), dataset)
+                    predicted_next_state, _ = get_next_state_through_search(
+                        state.cpu().numpy(), 
+                        dataset, 
+                        prediction_horizon=prediction_horizon
+                    )
                     predicted_next_state = torch.from_numpy(predicted_next_state).to(device).view(1, -1)
                     encoded_state = state.view(1, -1)
 
                 if world_model is not None:
                     # Update the running input and action
-                    running_latent = torch.roll(running_latent, -1, 0)
                     encoded_state = world_model.encoder_fwd(state.view(1, 1, -1)).squeeze(0)
-                    running_latent[-1] = encoded_state
-                    predicted_next_state = world_model.predictor_fwd([running_latent.view(1, horizon, -1), None, None])[0][-1, -1].unsqueeze(dim=0)
+                    if step == 1:
+                        running_latent[:] = encoded_state
+                    else:
+                        running_latent = torch.roll(running_latent, -1, 0)
+                        running_latent[-1] = encoded_state
+                    predicted_next_state = world_model.predictor_fwd([running_latent.view(1, horizon, -1), None, None], deterministic=deterministic_wm)[0][-1, -1].unsqueeze(dim=0)
                     og_predicted_next_state = predicted_next_state.clone()
                     pending_predictions.append(og_predicted_next_state)
 
@@ -69,6 +76,10 @@ def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes
 
                 if only_real_states:
                     action = agent([state.view(1, -1), None])
+                elif with_reconstruction:
+                    reconstructed_state = world_model.reconstructor_fwd(encoded_state)
+                    reconstructed_next_state = world_model.reconstructor_fwd(predicted_next_state)
+                    action = agent([reconstructed_state, reconstructed_next_state])
                 else:
                     action = agent([encoded_state, predicted_next_state])
 
@@ -81,7 +92,7 @@ def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes
                     encoded_next_state = world_model.encoder_fwd(torch.from_numpy(next_state).to(device).view(1, 1, -1)).squeeze(0)
                     if len(pending_predictions) >= world_model.prediction_horizon:
                         due_prediction = pending_predictions.popleft()
-                        accuracy = (torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.encoder_hidden_dim).item()
+                        accuracy = (torch.sum(torch.stack([a == b for a, b in zip(due_prediction, encoded_next_state)])) / world_model.fsq_output_size).item()
                         mean_accuracy += accuracy
                         accuracies.append(accuracy)
 
@@ -96,6 +107,7 @@ def evaluate_agent(env, agent, world_model, horizon, dataset=None, eval_episodes
             episode_rewards.append(episode_reward)
 
     print(f"Final performance over {eval_episodes} episodes: {np.mean(episode_rewards)}")
+    return np.mean(episode_rewards)
 
 #######################################################################################
 def create_agent(state_size, action_size, policy_arch, lr, device, only_real_states=False):
@@ -111,31 +123,47 @@ def create_agent(state_size, action_size, policy_arch, lr, device, only_real_sta
     return agent
 
 #######################################################################################
-def get_next_state_through_search(state, dataset):
+def get_next_state_through_search(state, dataset, normalization=True, prediction_horizon=1):
     # Given a state, get the closest next state in the dataset.
     # Similar to what the microsoft paper does
+    # TODO: In here, we do not care about cross-episode transitions
+    # for lunar lander there is no problem, but for more complex environments
+    # it could be a problem
 
     # The dataset is a list of transitions
     all_states = np.asarray(dataset["states"])
     feature_size = all_states.shape[1]
 
+    if normalization:
+
+        all_states_mean = np.mean(all_states, axis=0)
+        all_states_std = np.std(all_states, axis=0) 
+
+        all_states = (all_states - all_states_mean) / (all_states_std + 1e-6)
+
     state = np.asarray(state).reshape(1, feature_size)
+    if normalization:
+        state = (state - all_states_mean) / (all_states_std + 1e-6)
 
     # Get the distance
     distances = pairwise_distances(state, all_states)
     min_distance_index = np.argmin(distances.reshape(-1))
-    closest_next_state = dataset["next_states"][min_distance_index]
-    closest_state = dataset["next_states"][min_distance_index]
+    if prediction_horizon == 1:
+        closest_next_state = dataset["next_states"][min_distance_index]
+    else:
+        # Here we need to use the sate + t. For now, we do not care about cross-episode problems
+        closest_next_state = dataset["states"][min(min_distance_index + prediction_horizon, dataset["states"].shape[0] - 1)]
+    closest_state = dataset["states"][min_distance_index]
 
     return closest_next_state, closest_state
 
 #######################################################################################
-def create_world_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, L, model_name, mlp_encoder=False):
+def create_world_model(action_size, sequence_length, prediction_horizon, lr, device, fsq_input_size, fsq_output_size, encoder_dim, L, model_name, mlp_encoder=False):
     model = LeWorldModel(
         action_dim=action_size,
         max_seq_length=sequence_length,
         prediction_horizon=prediction_horizon,
-        encoder_hidden_dim=fsq_output_size,
+        encoder_hidden_dim=encoder_dim,
         lr = lr,
         device=device,
 
@@ -153,7 +181,6 @@ def create_world_model(action_size, sequence_length, prediction_horizon, lr, dev
     model.load_model(model_name)
 
     return model
-
 #######################################################################################
 def load_and_set_dataset(
         dataset_path, 
@@ -163,6 +190,9 @@ def load_and_set_dataset(
         world_model_batch_size,
         horizon,
         only_real_states=False,
+        prediction_horizon=1,
+        deterministic_wm=True,
+        with_reconstruction=False
         ):
 
     with open(dataset_path, "rb") as f:
@@ -190,8 +220,8 @@ def load_and_set_dataset(
 
     if world_model is not None:
         world_model.set_dataset(new_dataset)
-
         world_model.train()
+
         # We need to fine-tune the world model for what we have now 
         for epoch in range(world_model_epochs):
             losses = world_model.train_epoch(world_model_batch_size)
@@ -217,7 +247,7 @@ def load_and_set_dataset(
             ])
             current_indices = torch.from_numpy(sequence_starts + horizon - 1).to(device)
 
-            predicted_next_states = world_model.predictor_fwd([state_sequences, None, None])[0][:, -1, :]
+            predicted_next_states = world_model.predictor_fwd([state_sequences, None, None], deterministic=deterministic_wm)[0][:, -1, :]
             if world_model.fsq_encoder:
                 encoded_states = world_model.encoder.shift_and_scale(encoded_states)
                 predicted_next_states = world_model.encoder.shift_and_scale(predicted_next_states)
@@ -234,12 +264,24 @@ def load_and_set_dataset(
 
     # ABLATION: Train with only real states
     if world_model is None:
-        agent.set_dataset(
-            states=torch.from_numpy(new_dataset["states"]).to(device),
-            actions=torch.from_numpy(new_dataset["actions"]).to(device),
+        states=torch.from_numpy(new_dataset["states"]).to(device)
+        actions=torch.from_numpy(new_dataset["actions"]).to(device)
+        if prediction_horizon == 1:
             next_states=torch.from_numpy(new_dataset["next_states"]).to(device)
+        else:
+            next_states=states[prediction_horizon:, :]
+            states=states[:-prediction_horizon, :]
+            actions=actions[:-prediction_horizon, :]
+        agent.set_dataset(
+            states      = states,
+            actions     = actions,
+            next_states = next_states
         )
     else:
+        if with_reconstruction:
+            with torch.no_grad():
+                encoded_states = world_model.reconstructor_fwd(encoded_states)
+                encoded_next_states = world_model.reconstructor_fwd(encoded_next_states)
         agent.set_dataset(
             states=encoded_states,
             actions=actions,
@@ -290,102 +332,131 @@ if __name__ == "__main__":
     # Parse arguments for training
     parser = argparse.ArgumentParser()
 
-
     # Arguments for both the WM and the Agent
     parser.add_argument('-mn', '--model-name', help="The name with which we want to save the agent", default="pidm_lunar")
     parser.add_argument('-wm', '--world-model-name', help="The name of the world model we already trained", required=True)
     parser.add_argument('-dn', '--dataset-name', help="The name of the precollected dataset with which we train the world model", default="datasets/dataset.pkl")
     parser.add_argument('-as', '--action-size', help="The action dimension of the env", default=2, type=int)
     parser.add_argument('-is', '--input-size', help="The state dimension of the env", default=8, type=int)
-    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder, in this case an FSQ encoder", default=16, type=int)
+    parser.add_argument('-ed', '--encoder-dim', help="The dimension of the encoder", default=128, type=int)
+    parser.add_argument('-os', '--fsq-output-size', help="The dimension of the FSQ encoder", default=16, type=int)
     parser.add_argument('-ld', '--levels-dim', help="The dimension of levels for FSQ", default=12, type=int)
     parser.add_argument('-sl', '--sequence-length', help="The max sequence length of the world model", default=8, type=int)
-    parser.add_argument('-k', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
+    parser.add_argument('-ph', '--prediction-horizon', help="How many steps ahead the world model predicts", default=1, type=int)
     parser.add_argument('-bs', '--batch-size', help="The batch size during training", default=32, type=int)
     parser.add_argument('-en', '--epochs-number', help="The number of epochs during training", default=100, type=int)
-    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-3, type=float)
+    parser.add_argument('-lr', '--learning-rate', help="The learning rate used during training", default=1e-4, type=float)
     parser.add_argument('-wb', '--world-model-batch-size', help="The batch size during training of the world model", default=32, type=int)
     parser.add_argument('-wr', '--world-model-learning-rate', help="The learning rate used during training for the world model", default=5e-5, type=float)
     parser.add_argument('-ww', '--world-model-epochs-number', help="Number of fine-tuning epochs for the world model", default=5, type=int)
+    # Number of experiments 
+    parser.add_argument('-ne', '--number-of-experiments', help="Number of experiment for stability evaluation", default=1, type=int)
 
     # Ablations
     parser.add_argument('-rs', '--only-real-states', help="Wether to use only real states as input to the IL agent", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('-wf', '--without-fsq', help="If we want to run an ablation without fsq", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('-ws', '--with-search', help="If we want to use search instead of a world model", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('-rc', '--with-reconstruction', help="If we want to reconstruct the next state", action=argparse.BooleanOptionalAction, default=False)
 
 
     args = parser.parse_args()
 
-    print("")
-    print("####")
-    print(Fore.CYAN + "Creating the agent.." + Style.RESET_ALL)
-    print("...")
-    agent = create_agent(
-        state_size= args.input_size if args.only_real_states else args.encoder_dim * 2, # Because we have state and next state
-        action_size=args.action_size,
-        policy_arch=PolicyEmbedding,
-        lr=args.learning_rate,
-        device=device,
-        only_real_states=args.only_real_states
-    )
-    loaded, evaluate = check_if_model_exists(args.model_name, agent)
-    print(Fore.CYAN + "For this agent, we need a world model. Loading it now" + Style.RESET_ALL)
-    world_model = None
-    if not args.only_real_states and not args.with_search:
-        world_model = create_world_model(
-            action_size=args.action_size, 
-            sequence_length=args.sequence_length, 
-            prediction_horizon=args.prediction_horizon,
-            lr=args.world_model_learning_rate, 
-            model_name=args.world_model_name,
-            fsq_input_size=args.input_size, 
-            fsq_output_size=args.encoder_dim, 
-            L=args.levels_dim, 
-            mlp_encoder=args.without_fsq,
-            device=device
+    performance_across_experiments = []
+    for i in range(args.number_of_experiments):
+        print("")
+        print("####")
+        print(Fore.CYAN + "Creating the agent.." + Style.RESET_ALL)
+        print("...")
+
+        input_size = args.fsq_output_size * 2
+
+        if args.only_real_states:
+            input_size = args.input_size
+
+        if args.with_search:
+            input_size = args.input_size*2
+
+        if args.with_reconstruction:
+            input_size = args.input_size*2
+
+        agent = create_agent(
+            state_size=input_size,
+            action_size=args.action_size,
+            policy_arch=PolicyEmbedding,
+            lr=args.learning_rate,
+            device=device,
+            only_real_states=args.only_real_states
         )
-    print(Fore.GREEN + "Models created!" + Style.RESET_ALL)
-    print("####")
-
-    print(Fore.CYAN + "Loading dataset..." + Style.RESET_ALL)
-    print("...")
-    dataset = load_and_set_dataset(
-        dataset_path=args.dataset_name,
-        world_model=world_model,
-        agent=agent,
-        world_model_batch_size=args.world_model_batch_size,
-        world_model_epochs=args.world_model_epochs_number,
-        horizon=args.sequence_length,
-        only_real_states=args.only_real_states
-    )
-
-    if not args.with_search:
-        dataset = None
-
-    print(Fore.GREEN + "Dataset loaded!" + Style.RESET_ALL)
-    print("####")
-
-    if not evaluate:
-        print(Fore.RED + "Start training!" + Style.RESET_ALL)
-        train(
-            epochs_number=args.epochs_number, 
-            batch_size=args.batch_size, 
-            model=agent, 
-            model_name=args.model_name
-        )
-        print(Fore.GREEN + "Model trained!" + Style.RESET_ALL)
+        if args.number_of_experiments > 1:
+            laoded = evaluate = False
+        else:
+            loaded, evaluate = check_if_model_exists(args.model_name, agent)
+        print(Fore.CYAN + "For this agent, we need a world model. Loading it now" + Style.RESET_ALL)
+        world_model = None
+        if not args.only_real_states and not args.with_search:
+            world_model = create_world_model(
+                action_size=args.action_size, 
+                sequence_length=args.sequence_length, 
+                prediction_horizon=args.prediction_horizon,
+                lr=args.world_model_learning_rate, 
+                model_name=args.world_model_name,
+                fsq_input_size=args.input_size, 
+                fsq_output_size=args.fsq_output_size, 
+                encoder_dim=args.encoder_dim,
+                L=args.levels_dim, 
+                mlp_encoder=args.without_fsq,
+                device=device
+            )
+        print(Fore.GREEN + "Models created!" + Style.RESET_ALL)
         print("####")
 
-    print(Fore.GREEN + "Start evaluate!" + Style.RESET_ALL)
-    env = create_env()
-    agent.eval()
+        print(Fore.CYAN + "Loading dataset..." + Style.RESET_ALL)
+        print("...")
+        dataset = load_and_set_dataset(
+            dataset_path=args.dataset_name,
+            world_model=world_model,
+            agent=agent,
+            world_model_batch_size=args.world_model_batch_size,
+            world_model_epochs=args.world_model_epochs_number,
+            horizon=args.sequence_length,
+            only_real_states=args.only_real_states,
+            prediction_horizon=args.prediction_horizon,
+            with_reconstruction=args.with_reconstruction
+        )
 
-    evaluate_agent(
-        env=env,
-        agent=agent,
-        world_model=world_model,
-        horizon=args.sequence_length,
-        dataset=dataset,
-        eval_episodes=100,
-        only_real_states=args.only_real_states
-    )
+        if not args.with_search:
+            dataset = None
+
+        print(Fore.GREEN + "Dataset loaded!" + Style.RESET_ALL)
+        print("####")
+
+        if not evaluate:
+            print(Fore.RED + "Start training!" + Style.RESET_ALL)
+            train(
+                epochs_number=args.epochs_number, 
+                batch_size=args.batch_size, 
+                model=agent, 
+                model_name=args.model_name
+            )
+            print(Fore.GREEN + "Model trained!" + Style.RESET_ALL)
+            print("####")
+
+        print(Fore.GREEN + "Start evaluate!" + Style.RESET_ALL)
+        env = create_env()
+        agent.eval()
+
+        preformance = evaluate_agent(
+            env=env,
+            agent=agent,
+            world_model=world_model,
+            horizon=args.sequence_length,
+            dataset=dataset,
+            eval_episodes=100,
+            only_real_states=args.only_real_states,
+            prediction_horizon=args.prediction_horizon,
+            with_reconstruction=args.with_reconstruction
+        )
+
+        performance_across_experiments.append(preformance)
+
+    print(f"Final performance across experiments: {np.mean(performance_across_experiments)} +- {np.std(performance_across_experiments)}")
