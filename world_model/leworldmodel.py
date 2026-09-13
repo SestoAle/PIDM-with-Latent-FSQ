@@ -135,7 +135,9 @@ class LeWorldModel(nn.Module):
                  with_reward_prediction : bool = False,
                  with_terminal_prediction : bool = False,
                  # If this is a state-only model
-                 with_action : bool = True,
+                 with_action : bool = False,
+                 # Or, if we want an inverse action model
+                 with_inverse_action : bool = True,
                  # If it is feature base, we have FSQ hyperparameters
                  fsq_output_size : int = 256,
                  fsq_input_size : int = 256,
@@ -144,34 +146,33 @@ class LeWorldModel(nn.Module):
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self.action_dim                 = action_dim
-        self.device                     = device
-        self.encoder_hidden_dim         = encoder_hidden_dim
-        self.num_decoder_layers         = num_decoder_layers
-        self.max_seq_length             = max_seq_length
-        self.lambd_sigreg               = lambd_sigreg
-        self.lambd_reconstruction       = lambd_reconstruction
-        self.lambd_latent_l1            = lambd_latent_l1
-        self.lambd_reward               = lambd_reward
-        self.reward_priority_fraction   = reward_priority_fraction
-        self.reward_high_quantile       = reward_high_quantile
-        self.validation_fraction        = validation_fraction
-        self.validation_seed            = validation_seed
-        self.autoregressive_rollout_length = autoregressive_rollout_length
-        self.teacher_forcing_probability = teacher_forcing_probability
-        self.autoregressive_loss_weight = autoregressive_loss_weight
-        if prediction_horizon < 1:
-            raise ValueError("prediction_horizon must be at least 1")
-        self.prediction_horizon         = prediction_horizon
-        self.lr                         = lr
-        self.feature_base               = feature_base
-        self.fsq_output_size            = fsq_output_size
-        self.fsq_input_size             = fsq_input_size
-        self.fsq_L                      = L
-        self.with_terminal_prediction   = with_terminal_prediction
-        self.with_reward_prediction     = with_reward_prediction
-        self.fsq_encoder                = fsq_encoder
-        self.with_action                = with_action 
+        self.action_dim                     = action_dim
+        self.device                         = device
+        self.encoder_hidden_dim             = encoder_hidden_dim
+        self.num_decoder_layers             = num_decoder_layers
+        self.max_seq_length                 = max_seq_length
+        self.lambd_sigreg                   = lambd_sigreg
+        self.lambd_reconstruction           = lambd_reconstruction
+        self.lambd_latent_l1                = lambd_latent_l1
+        self.lambd_reward                   = lambd_reward
+        self.reward_priority_fraction       = reward_priority_fraction
+        self.reward_high_quantile           = reward_high_quantile
+        self.validation_fraction            = validation_fraction
+        self.validation_seed                = validation_seed
+        self.autoregressive_rollout_length  = autoregressive_rollout_length
+        self.teacher_forcing_probability    = teacher_forcing_probability
+        self.autoregressive_loss_weight     = autoregressive_loss_weight
+        self.prediction_horizon             = prediction_horizon
+        self.lr                             = lr
+        self.feature_base                   = feature_base
+        self.fsq_output_size                = fsq_output_size
+        self.fsq_input_size                 = fsq_input_size
+        self.fsq_L                          = L
+        self.with_terminal_prediction       = with_terminal_prediction
+        self.with_reward_prediction         = with_reward_prediction
+        self.fsq_encoder                    = fsq_encoder
+        self.with_action                    = with_action 
+        self.with_inverse_action                 = with_inverse_action
 
         # Sigreg is only for continuous latent space
         self.sigreg                 = SIGReg()
@@ -210,6 +211,13 @@ class LeWorldModel(nn.Module):
                     nn.Linear(self.fsq_output_size, self.encoder_hidden_dim),
                     nn.SiLU(),
                     nn.Linear(self.encoder_hidden_dim, self.fsq_input_size)
+                )
+
+                self.action_head = nn.Sequential(
+                    nn.Linear(self.fsq_output_size * 2, self.encoder_hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(self.encoder_hidden_dim, self.action_dim),
+                    nn.Tanh()
                 )
             else:
                 # For ablation, we are gonna use a MLP based encoder similar to the FSQ encoder
@@ -444,16 +452,21 @@ class LeWorldModel(nn.Module):
     
             reconstructed_states    = self.reconstruction_head(quantized_values)
             reconstruction_loss     = F.smooth_l1_loss(reconstructed_states, states_seq.float())
+
+            reconstructed_actions   = self.action_head(torch.concatenate([quantized_values[:, :-1], quantized_values[:, 1:]], dim=-1))
+            action_loss             = F.mse_loss(reconstructed_actions, actions_seq[:, :-1])
+
             sigreg_loss             = 0
         else:
-            pred_loss   = (labels - predicted).pow(2).mean()
-            sigreg_loss = self.sigreg(predicted.transpose(0, 1))
-            reconstruction_loss = 0
+            pred_loss               = (labels - predicted).pow(2).mean()
+            sigreg_loss             = self.sigreg(predicted.transpose(0, 1))
+            reconstruction_loss     = 0
+            action_loss             = 0
     
         reward_loss = 0
         if self.with_reward_prediction:
             rewards_seq     = rewards_seq.reshape(-1, 1)
-            reward_loss     = (rewards_seq - predicted_rewards) .pow(2).mean()
+            reward_loss     = (rewards_seq - predicted_rewards).pow(2).mean()
             
         terminal_loss = 0
         if self.with_terminal_prediction:
@@ -466,11 +479,13 @@ class LeWorldModel(nn.Module):
             + self.lambd_reconstruction * reconstruction_loss
             + reward_loss
             + terminal_loss
+            + action_loss
         )
         loss_dict   = dict(pred_loss=pred_loss, sigreg_loss=sigreg_loss)
         if self.fsq_encoder:
             loss_dict["categorical_loss"] = categorical_loss
             loss_dict["reconstruction_loss"] = reconstruction_loss
+            loss_dict["action_loss"] = action_loss
         if self.with_reward_prediction:
             loss_dict["rew_loss"] = reward_loss
             
