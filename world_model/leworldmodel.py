@@ -219,12 +219,16 @@ class LeWorldModel(nn.Module):
                     nn.Linear(self.encoder_hidden_dim, self.action_dim),
                     nn.Tanh()
                 )
+
             else:
                 # For ablation, we are gonna use a MLP based encoder similar to the FSQ encoder
                 self.encoder    = MLPEncoder(input_size=self.fsq_input_size, output_size=self.fsq_output_size)
 
         # ----- Predictor -----
         # The predictor is a transformer with 6 layers and 16 heads. Pretty big transformer
+        self.predictor_position_embedding = nn.Parameter(
+            torch.randn(1, self.max_seq_length, self.encoder_hidden_dim) * 0.02
+        )
         self.predictor        = nn.Sequential(
             *[Transformer(
                 state_dim=self.encoder_hidden_dim,
@@ -305,6 +309,7 @@ class LeWorldModel(nn.Module):
 
         # This may be unnecessary, but just to be sure
         action_seq = action_seq if self.with_action else None
+        emb = emb + self.predictor_position_embedding[:, :seq]
         emb, _, _ = self.predictor([emb, action_seq, None])
         bs = emb.shape[0]
         emb = rearrange(emb, "bs t f -> (bs t) f")
@@ -457,6 +462,7 @@ class LeWorldModel(nn.Module):
             action_loss             = F.mse_loss(reconstructed_actions, actions_seq[:, :-1])
 
             sigreg_loss             = 0
+
         else:
             pred_loss               = (labels - predicted).pow(2).mean()
             sigreg_loss             = self.sigreg(predicted.transpose(0, 1))
@@ -486,6 +492,7 @@ class LeWorldModel(nn.Module):
             loss_dict["categorical_loss"] = categorical_loss
             loss_dict["reconstruction_loss"] = reconstruction_loss
             loss_dict["action_loss"] = action_loss
+
         if self.with_reward_prediction:
             loss_dict["rew_loss"] = reward_loss
             
